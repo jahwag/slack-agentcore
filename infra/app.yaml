@@ -1,0 +1,241 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: slack-agentcore app - AgentCore Memory + Runtime, Slack gateway Lambda (SnapStart, Function URL)
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: slack-agentcore
+  ImageUri:
+    Type: String
+    Description: ECR image URI (with tag) of the agent container (linux/arm64)
+  RepositoryArn:
+    Type: String
+  SecretArn:
+    Type: String
+  ArtifactsBucket:
+    Type: String
+  LambdaCodeKey:
+    Type: String
+    Description: S3 key of the gateway jar (content-addressed, so a new key publishes a new SnapStart version)
+  LlmProvider:
+    Type: String
+    Default: bedrock-converse
+    AllowedValues: [bedrock-converse, anthropic]
+  BedrockModelId:
+    Type: String
+    Default: eu.anthropic.claude-haiku-4-5-20251001-v1:0
+  AnthropicModelId:
+    Type: String
+    Default: claude-opus-5-5
+
+Resources:
+  # ------------------------------------------------------------------ AgentCore Memory
+  Memory:
+    Type: AWS::BedrockAgentCore::Memory
+    Properties:
+      Name: slack_agentcore_memory
+      Description: Global learnings shared across all Slack channels, threads and users
+      EventExpiryDuration: 7
+      MemoryStrategies:
+        - SemanticMemoryStrategy:
+            Name: global_learnings
+            Description: Durable facts, decisions and corrections learned from Slack conversations
+            # Static namespace (no {actorId}/{sessionId}) => one shared pool of learnings.
+            Namespaces:
+              - /learnings/global/
+
+  # ------------------------------------------------------------------ AgentCore Runtime
+  RuntimeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: bedrock-agentcore.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+              ArnLike: { aws:SourceArn: !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:*" }
+      Policies:
+        - PolicyName: runtime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [ecr:BatchGetImage, ecr:GetDownloadUrlForLayer]
+                Resource: !Ref RepositoryArn
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents, logs:DescribeLogStreams]
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*"
+              - Effect: Allow
+                Action: logs:DescribeLogGroups
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals: { cloudwatch:namespace: bedrock-agentcore }
+              - Effect: Allow
+                Action: [bedrock-agentcore:GetWorkloadAccessToken, bedrock-agentcore:GetWorkloadAccessTokenForJWT, bedrock-agentcore:GetWorkloadAccessTokenForUserId]
+                Resource:
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default"
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default/workload-identity/*"
+              - Effect: Allow
+                Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
+                Resource:
+                  - "arn:aws:bedrock:*::foundation-model/*"
+                  - !Sub "arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*"
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:CreateEvent
+                  - bedrock-agentcore:GetEvent
+                  - bedrock-agentcore:ListEvents
+                  - bedrock-agentcore:DeleteEvent
+                  - bedrock-agentcore:ListSessions
+                  - bedrock-agentcore:RetrieveMemoryRecords
+                  - bedrock-agentcore:ListMemoryRecords
+                  - bedrock-agentcore:GetMemoryRecord
+                  - bedrock-agentcore:GetMemory
+                Resource: !GetAtt Memory.MemoryArn
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref SecretArn
+
+  AgentRuntime:
+    Type: AWS::BedrockAgentCore::Runtime
+    Properties:
+      AgentRuntimeName: slack_agentcore_agent
+      Description: Spring Boot 4 / Spring AI Slack agent
+      RoleArn: !GetAtt RuntimeRole.Arn
+      ProtocolConfiguration: HTTP
+      NetworkConfiguration:
+        NetworkMode: PUBLIC
+      AgentRuntimeArtifact:
+        ContainerConfiguration:
+          ContainerUri: !Ref ImageUri
+      EnvironmentVariables:
+        AGENTCORE_MEMORY_ID: !GetAtt Memory.MemoryId
+        LLM_PROVIDER: !Ref LlmProvider
+        BEDROCK_MODEL_ID: !Ref BedrockModelId
+        ANTHROPIC_MODEL_ID: !Ref AnthropicModelId
+        SECRET_ARN: !Ref SecretArn
+
+  # ------------------------------------------------------------------ Slack gateway Lambda
+  GatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${Prefix}-gateway"
+      RetentionInDays: 3
+
+  GatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: gateway
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${GatewayLogGroup.Arn}"
+              - Effect: Allow
+                Action: [secretsmanager:GetSecretValue, secretsmanager:DescribeSecret]
+                Resource: !Ref SecretArn
+              - Effect: Allow
+                Action: bedrock-agentcore:InvokeAgentRuntime
+                Resource:
+                  - !GetAtt AgentRuntime.AgentRuntimeArn
+                  - !Sub "${AgentRuntime.AgentRuntimeArn}/runtime-endpoint/*"
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${Prefix}-gateway:*"
+
+  GatewayFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${Prefix}-gateway"
+      Runtime: java21
+      Architectures: [arm64]
+      Handler: io.github.jahwag.slackgateway.Handler::handleRequest
+      MemorySize: 512
+      Timeout: 120
+      Role: !GetAtt GatewayRole.Arn
+      Code:
+        S3Bucket: !Ref ArtifactsBucket
+        S3Key: !Ref LambdaCodeKey
+      SnapStart:
+        ApplyOn: PublishedVersions
+      LoggingConfig:
+        LogGroup: !Ref GatewayLogGroup
+      Environment:
+        Variables:
+          SECRET_ARN: !Ref SecretArn
+          AGENT_RUNTIME_ARN: !GetAtt AgentRuntime.AgentRuntimeArn
+          SELF_QUALIFIER: live
+          JAVA_TOOL_OPTIONS: "-XX:+TieredCompilation -XX:TieredStopAtLevel=1"
+
+  # Version replacement is driven by the content-addressed code key + runtime ARN.
+  GatewayVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref GatewayFunction
+      Description: !Sub "${LambdaCodeKey} ${AgentRuntime.AgentRuntimeId}"
+
+  GatewayAlias:
+    Type: AWS::Lambda::Alias
+    Properties:
+      FunctionName: !Ref GatewayFunction
+      FunctionVersion: !GetAtt GatewayVersion.Version
+      Name: live
+
+  # The worker path must not retry: a retry would post a duplicate Slack reply.
+  GatewayAsyncConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref GatewayFunction
+      Qualifier: live
+      MaximumRetryAttempts: 0
+      MaximumEventAgeInSeconds: 300
+    DependsOn: GatewayAlias
+
+  GatewayUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !Ref GatewayAlias
+      AuthType: NONE   # requests are authenticated by the Slack HMAC signature in the handler
+
+  GatewayUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GatewayAlias
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+  GatewayUrlInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GatewayAlias
+      Action: lambda:InvokeFunction
+      Principal: "*"
+      InvokedViaFunctionUrl: true
+
+Outputs:
+  FunctionUrl:
+    Value: !GetAtt GatewayUrl.FunctionUrl
+  AgentRuntimeArn:
+    Value: !GetAtt AgentRuntime.AgentRuntimeArn
+  AgentRuntimeId:
+    Value: !GetAtt AgentRuntime.AgentRuntimeId
+  MemoryId:
+    Value: !GetAtt Memory.MemoryId

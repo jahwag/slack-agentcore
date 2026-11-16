@@ -1,0 +1,24 @@
+# Create at https://api.slack.com/apps -> Create New App -> From a manifest.
+# Do not paste as-is: run scripts/slack-manifest.sh, which fills in REQUEST_URL from the deployed stack.
+display_information:
+  name: AgentCore
+  description: Spring AI agent on Amazon Bedrock AgentCore that learns across channels
+  background_color: "#1d1c1d"
+features:
+  bot_user:
+    display_name: AgentCore
+    always_online: true
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read
+      - chat:write
+      - reactions:write
+settings:
+  event_subscriptions:
+    request_url: ${REQUEST_URL}
+    bot_events:
+      - app_mention
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: false

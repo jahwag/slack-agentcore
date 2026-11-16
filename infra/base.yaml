@@ -1,0 +1,56 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: slack-agentcore base - ECR repo, artifacts bucket, single Secrets Manager secret (cost-minimal)
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: slack-agentcore
+
+Resources:
+  AgentRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${Prefix}-agent"
+      EmptyOnDelete: true
+      ImageScanningConfiguration:
+        ScanOnPush: false
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules":[{"rulePriority":1,"description":"keep last 2 images",
+            "selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":2},
+            "action":{"type":"expire"}}]}
+
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${Prefix}-artifacts-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-artifacts
+            Status: Enabled
+            ExpirationInDays: 7
+
+  # One secret for everything (Secrets Manager bills per secret). Real values are set with
+  # `aws secretsmanager put-secret-value`, never in this template. Do not edit SecretString here:
+  # changing it would overwrite the real values on the next deploy.
+  AppSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Ref Prefix
+      Description: Slack signing secret + bot token, Anthropic API key
+      SecretString: '{"signingSecret":"CHANGE_ME","botToken":"CHANGE_ME","anthropicApiKey":"CHANGE_ME"}'
+
+Outputs:
+  RepositoryUri:
+    Value: !GetAtt AgentRepository.RepositoryUri
+  RepositoryArn:
+    Value: !GetAtt AgentRepository.Arn
+  ArtifactsBucket:
+    Value: !Ref ArtifactsBucket
+  SecretArn:
+    Value: !Ref AppSecret
